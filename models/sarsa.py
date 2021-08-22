@@ -13,7 +13,7 @@ class Agent:
         memory=6,
         discount_factor=0.9,
         step_size=0.1,
-        epsilon=0.02,
+        epsilon=0.01,
     ):
         # Get size of state and action space from the environment
         self._num_obs = env.observation_space.n

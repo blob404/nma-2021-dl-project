@@ -18,7 +18,7 @@ LIST_OF_AGENTS = ["vanilla_q", "sarsa", "deep_q"]
 LIST_OF_POLICIES = ["value_max", "epsilon_greedy"]
 
 DEFAULT_NETWORK = nn.Sequential(
-    nn.Linear(5, 50), nn.ReLU(), nn.Linear(50, 50), nn.ReLU(), nn.Linear(50, 4)
+    nn.Linear(5, 96), nn.ReLU(), nn.Linear(96, 128), nn.ReLU(), nn.Linear(128, 32), nn.ReLU(), nn.Linear(32, 4)
 )
 
 
@@ -104,7 +104,7 @@ def main(agent="vanilla_q", **kwargs):
     elif agent_name == "sarsa":
         metadata = f"sarsa_ep_{episodes}_mem_{agent._streak_memory}_eps_{agent._epsilon}_step_{agent._step_size}"
     elif agent_name == "deep_q":
-        metadata = f"deep_q_ep_{episodes}_bs_{agent._batch_size}_lr_{agent._learning_rate}"
+        metadata = f"deep_q_ep_{episodes}_bs_{agent.batch_size}_lr_{agent.learning_rate}"
 
     # create uniform logbook
     log = logbook(agent, metadata)
@@ -115,6 +115,7 @@ def main(agent="vanilla_q", **kwargs):
         )
 
     print(f"Return per episode: {returns}")
+    print(f"Total return: {np.sum(returns)}")
 
     if output == "csv":
         log.to_csv()

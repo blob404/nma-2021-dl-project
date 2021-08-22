@@ -1,100 +1,104 @@
-## TODO Create a deep Q-learning agent.
 import collections
 import torch
 import torch.nn as nn
+import numpy as np
 import copy
 from helper_functions import ReplayBuffer, map_action_to_rule
 from tqdm import tqdm
 import time
 from itertools import count
+from fastcore.foundation import *
+from fastcore.meta import *
+from fastcore.utils import *
+from fastcore.test import *
 
 # Create a convenient container for the SARS tuples required by NFQ.
 Transitions = collections.namedtuple(
     "Transitions", ["state", "action", "reward", "discount", "next_state"]
 )
+# TODO Try initializing the Q-table by using randomization.
+# TODO Try conceptual variations of the replay buffer.
+# TODO Try implementing different loss functions.
 
 class Agent():
-
   def __init__(self,
                env,
                q_network: nn.Module,
-               policy: str = "epsilon_greedy", #switch not implemented, just set epsilon = 0
                replay_capacity: int = 100_000,
-               epsilon: float = 0.1,
+               epsilon: float = 0.01,
                batch_size: int = 10,
-               learning_rate: float = 3e-4):
+               learning_rate: float = 6e-4,
+               memory: int = 6,
+               discount: float = 0.9):
 
-    # Store agent hyperparameters and network.
+    # Store all kwargs given to agent (i.e., hyperparameters).
+    store_attr()
+    # Get size of action space from the environment.
     self._num_actions = env.action_space.n
-    self._epsilon = epsilon
-    self._batch_size = batch_size
-    self._learning_rate = learning_rate
-    self._q_network = q_network
-
-    self._streak_memory = 6
-    self._discount = 0.9
-
-    self._env = env
-
-    # create a second q net with the same structure and initial values, which
+    # Create a second q net with the same structure and initial values, which
     # we'll be updating separately from the learned q-network.
-    self._target_network = copy.deepcopy(self._q_network)
-
-    # Container for the computed loss (see run_loop implementation above).
-    self.last_loss = 0.0
-
+    self._target_network = copy.deepcopy(self.q_network)
     # Create the replay buffer.
     self._replay_buffer = ReplayBuffer(replay_capacity)
+    # Set internal PyTorch parameters.
+    self._optimizer = torch.optim.Adam(self.q_network.parameters(),lr = learning_rate)
+    self._loss_fn = nn.MSELoss()
+    # Setup/reset model state.
+    self.reset()
+    self._action = np.random.randint(4) # Initialize action (which card was picked)
+    self._rule = np.random.randint(4) # Which category was picked on last attempt
 
-    # Keep an internal tracker of steps
-    self._current_step = 0
+  def reset(self):
+    """Reset/initialize model parameters, including:
+       observation, action, rule, streak and step counters, loss container"""
+    self.env.reset()
+    self._observation = self.env.card # Get first observation (card) from environment
+    self._streak_count = 0 # Track number of successive correct answers
 
-    # Setup optimizer that will train the network to minimize the loss.
-    self._optimizer = torch.optim.Adam(self._q_network.parameters(),lr = learning_rate)
-    self._loss_fn = nn.MSELoss() # try different loss functions?
+    # Game episode information (see run() implementation)
+    self._episode_steps = 0 # Keep an internal tracker of steps
+    self._episode_return = 0
+    self._episode_loss = 0
+    self._last_loss = 0.0 # Container for the computed loss (see run() implementation)
+    self._done = False
 
-    # Initialize observation
-    self._obs = env.card
-    # Initialize action (which card is picked)
-    self._action = 0
-    # Map action to rule (which category was picked on previous attempt)
-    self._rule = 0
-    # Get number of successive correct answers
-    self._streak = 0
+  def select_action(self, state):
+    """Compute Q-values through the prediction network for a given state vector,
+       and returns an action following epsilon-greedy policy.
 
+       state: 5-D int vector containing [card, prev_rule, streak_count].
+       Returns: action as an integer in range [0,3]."""
+    q_values = self.q_values(state)
 
-  def select_action(self, observation):
-    # Compute Q-values.
-    q_values = self._q_network(torch.FloatTensor(observation).unsqueeze(0))  # Adds batch dimension.
-    q_values = q_values.squeeze(0)   # Removes batch dimension
-
-    # Select epsilon-greedy action.
-    if self._epsilon < torch.rand(1):
-      # TODO randomize initialization?
+    if self.epsilon < torch.rand(1):
       action = q_values.argmax(axis=-1)
     else:
       action = torch.randint(low=0, high=self._num_actions , size=(1,), dtype=torch.int64)
     return action
 
-  def q_values(self, observation):
-    # q_values = self._q_network(torch.tensor(observation).unsqueeze(0))
-    # return q_values.squeeze(0).detach()
-    q_values = self._q_network(torch.FloatTensor(observation)).detach()
+  def q_values(self, state):
+    """Computes Q-values through the prediction network for a given state vector.
+       Handles both single and batch vectors.
+       Returns a tensor."""
+    # TODO handle
+    print(f"shape of state: {state.shape}")
+    # Adds batch dimension.
+    q_values = self.q_network(torch.FloatTensor(state).unsqueeze(0))
+    # Removes batch dimension and detaches from graph.
+    q_values = q_values.squeeze(0)
+    return q_values
 
   def get_state(self):
-    state = [x for x in self._obs]
-    state.append(self._rule)
-    state.append(self._streak)
+    """Returns a 5-D state representation containing [card, prev_rule, streak_count]
+       represented as integers."""
+    state = [x for x in self._observation] # Unfold card tuple
+    state.append(self._rule) # Get previous rule applied
+    state.append(self._streak_count)
     return state
 
-  def update(self):
-
-    if not self._replay_buffer.is_ready(self._batch_size):
-      # If the replay buffer is not ready to sample from, do nothing.
-      return
-
+  def sample_replay_buffer(self):
     # Sample a minibatch of transitions from experience replay.
-    transitions = self._replay_buffer.sample(self._batch_size)
+    transitions = self._replay_buffer.sample(self.batch_size)
 
     # Note: each of these tensors will be of shape [batch_size, ...].
     s = torch.FloatTensor(transitions.state)
@@ -102,25 +106,27 @@ class Agent():
     r = torch.FloatTensor(transitions.reward)
     d = torch.FloatTensor(transitions.discount)
     next_s = torch.FloatTensor(transitions.next_state)
-    # print(f"next_s: {next_s}")
-    # print(f"buffer: {self._replay_buffer.buffer}")
 
+    return s, a, r, d, next_s
+
+  def next_q_values(self, **kwargs):
     # Compute the Q-values at next states in the transitions.
     with torch.no_grad():
-      # NOTE: okay so here's the thing /blob404
-      # - first nn layer should be (state_dimensions, hidden_size)
-      # - for now i put only the card tuple as the state (i.e. 3 dimensions)
-      # - it should work with both single states (3x1) and batches (e.g., 3x10)
-      # - i can't figure out how to make it accept both shapes unless i transpose the batch vector like below
-      # - (maybe there is some other way to do this)
-      # - it's now running complete training cycles, but i have no idea if it's doing the right thing
-      q_next_s = self._q_network(next_s.T)  # Shape [batch_size, num_actions].
+      # NOTE: Not sure if transposing is the canonically "correct" thing to do here.
+      q_next_s = self.q_network(next_s.T)  # Shape [batch_size, num_actions].
       max_q_next_s = q_next_s.max(axis=-1)[0]
+
+    return q_next_s, max_q_next_s, kwargs
+
+  def td_error(self, **kwargs):
       # Compute the TD error and then the losses.
       target_q_value = r + d * max_q_next_s
+      return target_q_value, kwargs
 
-    # Compute the Q-values at original state.
-    q_s = self._q_network(s.T)
+
+  def grad_update(self, **kwargs):
+    # Compute the Q-values at original state. TODO move this
+    q_s = self.q_network(s.T)
 
     # Gather the Q-value corresponding to each action in the batch.
     q_s_a = q_s.gather(1, a.view(-1,1)).squeeze(1)
@@ -135,22 +141,88 @@ class Agent():
     self._optimizer.step()
 
     # Store the loss for logging purposes (see run_loop implementation above).
-    self.last_loss = loss.detach().numpy()
+    self._last_loss = loss.detach().numpy()
 
   def observe_first(self, observation):
     self._replay_buffer.add_first(observation)
 
-  def observe(self, action: int, reward, next_obs, discount):
-    self._replay_buffer.add(action, reward, next_obs, discount)
+  def observe(self, action: int, reward, next_state):
+    discount = self.discount ** self._episode_steps
+    self._replay_buffer.add(action, reward, next_state, discount)
 
-  def run(self,
-              num_episodes: int = 100,
-              log_loss=False,
-              logbook=None,
-              ):
-    """Perform the run loop.
+    return action, reward, next_state, discount
 
-    We are following the Acme run loop.
+  def update_network(self, **kwargs):
+    if not self._replay_buffer.is_ready(self.batch_size):
+      # If the replay buffer is not ready to sample from, do nothing.
+      return
+
+    pipeline = compose(
+      self.sample_replay_buffer,
+      self.next_q_values,
+      self.td_error,
+      self.q_values,
+      self.grad_update
+    )
+
+    return pipeline, kwargs
+
+  def update_agent(self):
+    # Generate an action from the agent's policy and step the environment.
+    action = self._action = int(self.select_action(state))
+    reward, next_obs, done, _ = self.env.step(action)
+
+    # Update streak counter if reward is positive.
+    if reward == 1:
+        self._streak_count = min(self._streak_count+1, self.memory)
+    else:
+        self._streak_count = 0
+
+    # Update internal state.
+    self._rule = map_action_to_rule(self._observation, action)
+    self._observation = next_obs
+
+    # Get state representation (different from observation)
+    next_state = self.get_state()
+
+    return action, reward, next_state
+
+  def log_steps(self, **kwargs):
+    self._episode_steps += 1
+    self._episode_return += reward
+
+    # if log_loss: # unused for now
+    #   self._episode_loss += agent.last_loss
+
+    if logbook:
+      logbook.write_actions(episode, self._episode_return)
+
+    return kwargs
+
+  def log_episode(self, logbook, **kwargs):
+      if logbook:
+        logbook.write_episodes(self._episode, self._episode_steps, self._episode_return)
+
+      self._total_returns.append(self._episode_return)
+
+      return kwargs
+
+  def init_episode(self, episode):
+      start_time = time.time() # TODO refactor into logging function
+      # Reset parameters and start the environment.
+      self.reset()
+      # Get first state and store it in the replay buffer.
+      state = self.get_state()
+      self.observe_first(state)
+
+      self._episode = episode
+
+  # def logfn():
+
+  # @logfn
+  def run(self, num_episodes: int = 100,
+          log_loss=False, logbook=None,):
+    """Perform the run loop (based on Acme implementation).
 
     Run the environment loop for `num_episodes` episodes. Each episode is itself
     a loop which interacts first with the environment to get an observation and
@@ -160,74 +232,31 @@ class Agent():
     infinitely.
 
     Args:
-      environment: dm_env used to generate trajectories.
-      agent: acme.Actor for selecting actions in the run loop.
-      num_training_steps: number of steps to run the loop for. If `None` (default), runs
-        without limit.
       num_episodes: number of episodes to run the loop for. If `None` (default),
         runs without limit.
-      label: optional label used at logging steps.
+      log_loss: enable/disable logging results of the loss function.
+      logbook: object that handles detailed log data and .csv output.
+        If `None` (default), only the list of returns for each episode
+        will be saved and subsequently returned by this function.
     """
     iterator = range(num_episodes) if num_episodes else itertools.count()
-    all_returns = []
+    self._total_returns = []
 
     for episode in tqdm(iterator):
-      # Reset any counts and start the environment.
-      start_time = time.time()
-      episode_steps = 0
-      cum_return = 0
-      episode_loss = 0
-
-      self._env.reset()
-      self._obs = self._env.card
-
-      state = self.get_state()
-      done = False
-
-      # Put first state into replay buffer
-      self.observe_first(state)
+      self.init_episode(episode)
 
       # Run an episode.
-      while not done:
+      while not self._done:
 
-        # Generate an action from the agent's policy and step the environment.
-        action = self._action = int(self.select_action(state))
-        reward, next_obs, done, _ = self._env.step(action)
+        pipeline = compose(
+          self.update_agent,
+          self.observe,
+          self.update_network,
+          self.log_steps
+        )
 
-        if reward == 1:
-            self._streak = min(self._streak+1, self._streak_memory)
-        else:
-            self._streak = 0
+        result = pipeline()
 
-        self._rule = map_action_to_rule(self._obs, action)
-        self._obs = next_obs
-
-        next_state = self.get_state()
-
-        # Have the agent observe the timestep and let the agent update itself.
-        # TODO how to implement discount???
-        discount = self._discount
-        self.observe(action, reward, next_state, discount**episode_steps) #this discount will probably cause some weird behavior
-        self.update()
-
-        state = next_state
-
-        # Book-keeping.
-        episode_steps += 1
-        cum_return += reward
-
-        # if log_loss: # unused for now
-        #   episode_loss += agent.last_loss
-
-        if logbook:
-          logbook.write_actions(episode, cum_return)
-
-        if done:
-            break
-
-      if logbook:
-        logbook.write_episodes(episode, episode_steps, cum_return)
-
-      all_returns.append(cum_return)
+      self.log_episode(logbook)
 
     return all_returns
